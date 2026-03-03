@@ -234,6 +234,9 @@ struct ExpectConfig {
     /// Completion-item predicates that must not match any completion item.
     #[serde(default, rename = "absentItems")]
     absent_items: Vec<CompletionItemExpect>,
+    /// For workspace/executeCommand: expect result.success == true/false.
+    #[serde(default)]
+    success: Option<bool>,
 }
 
 /// A file snapshot sent via didChange, with its own cursor position.
@@ -386,6 +389,19 @@ struct MethodConfig {
     /// relative to the project root (e.g. "src/libraries/Pool.sol").
     #[serde(default)]
     file: Option<String>,
+    /// Command name for workspace/executeCommand (e.g. "solidity.reindex").
+    /// Required when benchmarking workspace/executeCommand.
+    #[serde(default)]
+    command: Option<String>,
+    /// Arguments for workspace/executeCommand. Defaults to an empty array.
+    #[serde(default)]
+    arguments: Vec<Value>,
+    /// After receiving the response, wait for a $/progress end notification
+    /// before recording the iteration time. Useful for workspace/executeCommand
+    /// when you want to measure end-to-end time including background work
+    /// (e.g. solidity.reindex completing the full project rebuild).
+    #[serde(default, rename = "waitForProgress")]
+    wait_for_progress: bool,
     /// Expected response for the base request (no didChange). Used by --verify.
     #[serde(default)]
     expect: Option<ExpectConfig>,
@@ -1281,6 +1297,10 @@ fn method_allows_null_result(method: &str) -> bool {
     )
 }
 
+fn method_allows_object_result(method: &str) -> bool {
+    matches!(method, "workspace/executeCommand")
+}
+
 fn is_valid_response_for_method(method: &str, resp: &Value) -> bool {
     if resp.get("error").is_some() {
         return false;
@@ -1299,6 +1319,10 @@ fn is_valid_response_for_method(method: &str, resp: &Value) -> bool {
             // An empty items array means no completions were returned
             if let Some(items) = r.get("items").and_then(|v| v.as_array()) {
                 return !items.is_empty();
+            }
+            // Object results (e.g. workspace/executeCommand returns { success: true })
+            if r.is_object() {
+                return method_allows_object_result(method);
             }
             true
         }
@@ -1407,6 +1431,20 @@ fn check_expectation(resp: &Value, expect: &ExpectConfig) -> Result<(), String> 
             return Err(format!(
                 "minCount: expected >= {} but got {}",
                 min, actual_count
+            ));
+        }
+    }
+
+    // Check success field (workspace/executeCommand)
+    if let Some(expected_success) = expect.success {
+        let actual_success = result
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if actual_success != expected_success {
+            return Err(format!(
+                "success: expected {} but got {}",
+                expected_success, actual_success
             ));
         }
     }
@@ -1943,6 +1981,10 @@ fn bench_lsp_method(
     on_progress: &dyn Fn(&str),
     init_settings: Option<&Value>,
     verbose: bool,
+    // When true, wait for a $/progress end notification after each response.
+    // Useful for workspace/executeCommand when the command triggers background
+    // work (e.g. solidity.reindex) and you want to measure end-to-end time.
+    wait_for_progress: bool,
 ) -> BenchResult {
     on_progress("spawning");
     let mut c = match LspClient::spawn(&srv.cmd, &srv.args, cwd, verbose) {
@@ -2005,8 +2047,12 @@ fn bench_lsp_method(
             };
             match c.read_response(req_id, timeout) {
                 Ok(resp) => {
-                    let ms = start.elapsed().as_secs_f64() * 1000.0;
                     if is_valid_response_for_method(method, &resp) {
+                        if wait_for_progress {
+                            on_progress(&format!("{}  waiting for progress", iter_msg(i, w, n)));
+                            c.wait_for_progress_end(index_timeout);
+                        }
+                        let ms = start.elapsed().as_secs_f64() * 1000.0;
                         on_progress(&format!("{}  {:.1}ms", iter_msg(i, w, n), ms));
                         if i >= w {
                             let summary = response_summary(&resp, response_limit);
@@ -3348,6 +3394,15 @@ fn save_json(
                 if let Some(ref n) = v.new_name {
                     obj.insert("newName".into(), json!(n));
                 }
+                if let Some(ref cmd) = v.command {
+                    obj.insert("command".into(), json!(cmd));
+                }
+                if !v.arguments.is_empty() {
+                    obj.insert("arguments".into(), json!(v.arguments));
+                }
+                if v.wait_for_progress {
+                    obj.insert("waitForProgress".into(), json!(true));
+                }
                 (k.clone(), Value::Object(obj))
             })
             .collect();
@@ -3411,6 +3466,7 @@ const ALL_BENCHMARKS: &[&str] = &[
     "workspace/willRenameFiles",
     "workspace/willCreateFiles",
     "workspace/willDeleteFiles",
+    "workspace/executeCommand",
 ];
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -4010,6 +4066,18 @@ fn main() {
             }]
         })
     };
+    let execute_command_params = |method: &str, _file_uri: &str| -> Value {
+        let method_cfg = methods.get(method);
+        let command = method_cfg
+            .and_then(|m| m.command.as_deref())
+            .unwrap_or("solidity.reindex")
+            .to_string();
+        let arguments = method_cfg.map(|m| m.arguments.clone()).unwrap_or_default();
+        json!({
+            "command": command,
+            "arguments": arguments,
+        })
+    };
     let semantic_tokens_range_params = |method: &str, file_uri: &str| -> Value {
         let (sl, sc) = start_pos_for(method);
         let (el, ec) = pos_for(method);
@@ -4137,6 +4205,11 @@ fn main() {
             "workspace/willDeleteFiles",
             "workspace/willDeleteFiles",
             &will_delete_params,
+        ),
+        (
+            "workspace/executeCommand",
+            "workspace/executeCommand",
+            &execute_command_params,
         ),
     ];
 
@@ -4476,6 +4549,7 @@ fn main() {
                     )
                 })
             } else if snapshots.is_empty() {
+                let wait_for_progress = methods.get(*method).map_or(false, |m| m.wait_for_progress);
                 run_bench(&avail, response_limit, |srv, on_progress| {
                     bench_lsp_method(
                         srv,
@@ -4492,6 +4566,7 @@ fn main() {
                         on_progress,
                         init_settings.as_ref(),
                         verbose,
+                        wait_for_progress,
                     )
                 })
             } else {
