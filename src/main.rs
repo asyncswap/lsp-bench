@@ -406,6 +406,13 @@ struct MethodConfig {
     /// (e.g. solidity.reindex completing the full project rebuild).
     #[serde(default, rename = "waitForProgress")]
     wait_for_progress: bool,
+    /// Wait for a $/progress end with a specific token before sending the
+    /// request (cold-start only). When set, ignores progress-end notifications
+    /// with different tokens. Use "solidity/projectIndexFull" to wait for the
+    /// full two-phase index to complete.
+    #[serde(default, rename = "waitForProgressToken")]
+    wait_for_progress_token: Option<String>,
+
     /// Expected response for the base request (no didChange). Used by --verify.
     #[serde(default)]
     expect: Option<ExpectConfig>,
@@ -950,7 +957,10 @@ impl LspClient {
     /// indexing). Drains all notifications until it sees one with
     /// `value.kind == "end"`, or until timeout. Auto-responds to
     /// `window/workDoneProgress/create` requests from the server.
-    fn wait_for_progress_end(&mut self, timeout: Duration) {
+    ///
+    /// If `token_filter` is `Some`, only matches progress-end notifications
+    /// whose `params.token` equals the given string.
+    fn wait_for_progress_end(&mut self, timeout: Duration, token_filter: Option<&str>) {
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -969,12 +979,21 @@ impl LspClient {
                 }
             }
             if msg.get("method").and_then(|m| m.as_str()) == Some("$/progress") {
-                let kind = msg
-                    .get("params")
+                let params = msg.get("params");
+                let kind = params
                     .and_then(|p| p.get("value"))
                     .and_then(|v| v.get("kind"))
                     .and_then(|k| k.as_str());
                 if kind == Some("end") {
+                    // If a token filter is set, only match that specific token.
+                    if let Some(expected) = token_filter {
+                        let token = params.and_then(|p| p.get("token")).and_then(|t| t.as_str());
+                        if token == Some(expected) {
+                            return;
+                        }
+                        // Wrong token — keep waiting.
+                        continue;
+                    }
                     return;
                 }
             }
@@ -2042,6 +2061,7 @@ fn bench_lsp_method_cold(
     on_progress: &dyn Fn(&str),
     init_settings: Option<&Value>,
     verbose: bool,
+    progress_token: Option<&str>,
 ) -> BenchResult {
     let mut iterations = Vec::new();
     let mut peak_rss: Option<u64> = None;
@@ -2093,11 +2113,19 @@ fn bench_lsp_method_cold(
 
         if needs_index_ready {
             // For index-dependent methods, wait for $/progress end which
-            // signals the full project index is complete.  This is the
-            // correct signal — diagnostics arrive from the single-file
-            // compile much earlier and would give a misleading timing.
-            on_progress(&format!("{}  waiting for project index", iter_msg(i, w, n)));
-            c.wait_for_progress_end(timeout);
+            // signals the project index is complete.  When progress_token
+            // is set, wait for that specific token (e.g. "solidity/projectIndexFull"
+            // for the full two-phase index).
+            if let Some(token) = progress_token {
+                on_progress(&format!(
+                    "{}  waiting for progress: {}",
+                    iter_msg(i, w, n),
+                    token
+                ));
+            } else {
+                on_progress(&format!("{}  waiting for project index", iter_msg(i, w, n)));
+            }
+            c.wait_for_progress_end(timeout, progress_token);
         } else {
             // For methods that only need single-file data, wait for
             // diagnostics (the single-file compile).
@@ -2239,7 +2267,7 @@ fn bench_lsp_method(
         || method == "workspace/symbol";
     if needs_index_ready {
         on_progress("waiting for project index");
-        c.wait_for_progress_end(index_timeout);
+        c.wait_for_progress_end(index_timeout, None);
     }
 
     // Sample RSS after indexing
@@ -2262,7 +2290,7 @@ fn bench_lsp_method(
                     if is_valid_response_for_method(method, &resp) {
                         if wait_for_progress {
                             on_progress(&format!("{}  waiting for progress", iter_msg(i, w, n)));
-                            c.wait_for_progress_end(index_timeout);
+                            c.wait_for_progress_end(index_timeout, None);
                         }
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
                         on_progress(&format!("{}  {:.1}ms", iter_msg(i, w, n), ms));
@@ -2636,7 +2664,7 @@ fn bench_lsp_rename_sequence(
         };
     }
     on_progress("waiting for project index");
-    c.wait_for_progress_end(index_timeout);
+    c.wait_for_progress_end(index_timeout, None);
 
     let rss_kb = get_rss(c.child.id());
     // Always run rename cycles and return to the original filename by renaming
@@ -2965,7 +2993,7 @@ fn bench_lsp_rename_sequence(
             total,
             step_label
         ));
-        c.wait_for_progress_end(index_timeout);
+        c.wait_for_progress_end(index_timeout, None);
     }
 
     // Restore all files to original state
@@ -3124,7 +3152,7 @@ fn bench_lsp_create_sequence(
         };
     }
     on_progress("waiting for project index");
-    c.wait_for_progress_end(index_timeout);
+    c.wait_for_progress_end(index_timeout, None);
 
     let rss_kb = get_rss(c.child.id());
     let mut iterations = Vec::new();
@@ -3192,7 +3220,7 @@ fn bench_lsp_create_sequence(
 
         let did_create = json!({ "files": [{ "uri": uri(&new_path) }] });
         let _ = c.notif("workspace/didCreateFiles", did_create);
-        c.wait_for_progress_end(index_timeout);
+        c.wait_for_progress_end(index_timeout, None);
     }
 
     for p in created_paths {
@@ -3250,7 +3278,7 @@ fn bench_lsp_delete_sequence(
         };
     }
     on_progress("waiting for project index");
-    c.wait_for_progress_end(index_timeout);
+    c.wait_for_progress_end(index_timeout, None);
 
     let rss_kb = get_rss(c.child.id());
     let mut iterations = Vec::new();
@@ -3313,7 +3341,7 @@ fn bench_lsp_delete_sequence(
         let _ = std::fs::remove_file(&del_path);
         let did_delete = json!({ "files": [{ "uri": uri(&del_path) }] });
         let _ = c.notif("workspace/didDeleteFiles", did_delete);
-        c.wait_for_progress_end(index_timeout);
+        c.wait_for_progress_end(index_timeout, None);
     }
 
     restore_files(&[], &content_restore);
@@ -4716,6 +4744,9 @@ fn main() {
                     )
                 })
             } else if is_cold {
+                let progress_token = methods
+                    .get(*method)
+                    .and_then(|m| m.wait_for_progress_token.as_deref());
                 run_bench(&avail, response_limit, |srv, on_progress| {
                     bench_lsp_method_cold(
                         srv,
@@ -4731,6 +4762,7 @@ fn main() {
                         on_progress,
                         init_settings.as_ref(),
                         verbose,
+                        progress_token,
                     )
                 })
             } else if !did_open_steps.is_empty() {
