@@ -750,8 +750,11 @@ fn reader_thread(
     stdout: std::process::ChildStdout,
     tx: mpsc::Sender<Value>,
     logs: Arc<Mutex<Vec<String>>>,
+    verbose: bool,
 ) {
     let mut reader = BufReader::new(stdout);
+    let start = Instant::now();
+    let mut last_log = start;
     loop {
         let mut content_length: usize = 0;
         let mut in_header = false;
@@ -796,8 +799,56 @@ fn reader_thread(
                     .and_then(|p| p.get("message"))
                     .and_then(|m| m.as_str())
                 {
+                    if verbose {
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(start);
+                        let delta = now.duration_since(last_log);
+                        last_log = now;
+                        eprintln!(
+                            "  {} {} {}",
+                            style(format!(
+                                "[+{:.1}s Δ{:.0}ms]",
+                                elapsed.as_secs_f64(),
+                                delta.as_millis()
+                            ))
+                            .dim(),
+                            style("log").dim(),
+                            style(text).dim(),
+                        );
+                    }
                     if let Ok(mut l) = logs.lock() {
                         l.push(text.to_string());
+                    }
+                }
+            }
+            // Stream $/progress notifications in verbose mode
+            if verbose {
+                if msg.get("method").and_then(|m| m.as_str()) == Some("$/progress") {
+                    if let Some(value) = msg.get("params").and_then(|p| p.get("value")) {
+                        let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                        let message = value.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                        let title = value.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(start);
+                        let delta = now.duration_since(last_log);
+                        last_log = now;
+                        let detail = match kind {
+                            "begin" => format!("{}: {}", title, message),
+                            "report" => message.to_string(),
+                            "end" => format!("done: {}", message),
+                            _ => format!("{}: {}", kind, message),
+                        };
+                        eprintln!(
+                            "  {} {} {}",
+                            style(format!(
+                                "[+{:.1}s Δ{:.0}ms]",
+                                elapsed.as_secs_f64(),
+                                delta.as_millis()
+                            ))
+                            .dim(),
+                            style("progress").cyan().dim(),
+                            style(detail).dim(),
+                        );
                     }
                 }
             }
@@ -835,7 +886,7 @@ impl LspClient {
         let (tx, rx) = mpsc::channel();
         let logs = Arc::new(Mutex::new(Vec::new()));
         let logs_clone = logs.clone();
-        std::thread::spawn(move || reader_thread(stdout, tx, logs_clone));
+        std::thread::spawn(move || reader_thread(stdout, tx, logs_clone, verbose));
         Ok(Self {
             child,
             rx,
@@ -2014,6 +2065,23 @@ fn bench_lsp_method_cold(
 
         let file_uri = uri(target_file);
 
+        // Check if this method depends on the background project index
+        // (cross-file references, goto-definition, etc.).
+        let needs_index_ready = method.contains("willRename")
+            || method.contains("willDelete")
+            || method == "textDocument/definition"
+            || method == "textDocument/declaration"
+            || method == "textDocument/hover"
+            || method == "textDocument/references"
+            || method == "textDocument/completion"
+            || method == "textDocument/signatureHelp"
+            || method == "textDocument/rename"
+            || method == "textDocument/prepareRename"
+            || method == "textDocument/documentHighlight"
+            || method == "textDocument/inlayHint"
+            || method == "textDocument/documentLink"
+            || method == "workspace/symbol";
+
         // Start timing from didOpen — this is what the user feels
         let start = Instant::now();
         if let Err(e) = c.open_file(target_file) {
@@ -2023,16 +2091,26 @@ fn bench_lsp_method_cold(
             };
         }
 
-        // Wait for diagnostics (compilation)
-        on_progress(&format!("{}  waiting for diagnostics", iter_msg(i, w, n)));
-        match c.wait_for_valid_diagnostics(timeout) {
-            Ok(_) => {}
-            Err(e) => {
-                let rss = get_rss(c.child.id());
-                return BenchResult::Fail {
-                    error: format!("wait_for_diagnostics: {}", e),
-                    rss_kb: rss,
-                };
+        if needs_index_ready {
+            // For index-dependent methods, wait for $/progress end which
+            // signals the full project index is complete.  This is the
+            // correct signal — diagnostics arrive from the single-file
+            // compile much earlier and would give a misleading timing.
+            on_progress(&format!("{}  waiting for project index", iter_msg(i, w, n)));
+            c.wait_for_progress_end(timeout);
+        } else {
+            // For methods that only need single-file data, wait for
+            // diagnostics (the single-file compile).
+            on_progress(&format!("{}  waiting for diagnostics", iter_msg(i, w, n)));
+            match c.wait_for_valid_diagnostics(timeout) {
+                Ok(_) => {}
+                Err(e) => {
+                    let rss = get_rss(c.child.id());
+                    return BenchResult::Fail {
+                        error: format!("wait_for_diagnostics: {}", e),
+                        rss_kb: rss,
+                    };
+                }
             }
         }
 
