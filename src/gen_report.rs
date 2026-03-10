@@ -521,6 +521,11 @@ fn human_result(bench_name: &str, srv: &Value) -> String {
         return summarize_formatting(&response);
     }
 
+    // call hierarchy (prepare / incoming / outgoing)
+    if method.contains("callhierarchy") || method.contains("preparecallhierarchy") {
+        return summarize_call_hierarchy(&response);
+    }
+
     // initialize / spawn
     if method.contains("init") || method.contains("spawn") {
         if response.is_string() && response.as_str() == Some("ok") {
@@ -533,6 +538,48 @@ fn human_result(bench_name: &str, srv: &Value) -> String {
     }
 
     format_response_fallback(&response)
+}
+
+/// call hierarchy → "N items: func1, func2, ..."
+///
+/// Works for:
+/// - `textDocument/prepareCallHierarchy` → array of CallHierarchyItem
+/// - `callHierarchy/incomingCalls` → array of { from: CallHierarchyItem, fromRanges }
+/// - `callHierarchy/outgoingCalls` → array of { to: CallHierarchyItem, fromRanges }
+fn summarize_call_hierarchy(response: &Value) -> String {
+    let arr = match response.as_array() {
+        Some(a) => a,
+        None => {
+            if response.is_null() || response_is_empty(response) {
+                return "empty".into();
+            }
+            return format_response_fallback(response);
+        }
+    };
+    if arr.is_empty() {
+        return "0 items".into();
+    }
+    // Extract names: direct "name" for prepare, "from.name" for incoming, "to.name" for outgoing
+    let names: Vec<&str> = arr
+        .iter()
+        .filter_map(|item| {
+            item.get("name")
+                .or_else(|| item.get("from").and_then(|f| f.get("name")))
+                .or_else(|| item.get("to").and_then(|t| t.get("name")))
+                .and_then(|v| v.as_str())
+        })
+        .collect();
+    let count = arr.len();
+    if names.is_empty() {
+        return format!("{} items", count);
+    }
+    let shown: Vec<&str> = names.iter().take(3).copied().collect();
+    let suffix = if count > 3 {
+        format!(", ... (+{})", count - 3)
+    } else {
+        String::new()
+    };
+    format!("{} items: `{}`{}", count, shown.join("`, `"), suffix)
 }
 
 /// definition/declaration → "File.sol:line"
