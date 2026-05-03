@@ -462,10 +462,10 @@ struct MethodConfig {
     did_open: Vec<DidOpenStep>,
     /// Batch of cross-file requests. Each entry opens its `file` (idempotent),
     /// waits for diagnostics, then sends the method request at that entry's
-    /// `(file, line, col)` — exercising different cursor positions across
-    /// files in one bench session. Useful for validating cross-file
-    /// enumeration symmetry (e.g. `textDocument/references` should return
-    /// the same set regardless of which usage site the cursor is on).
+    /// `(file, line, col)`. Lets one bench session check the same method
+    /// from many places — e.g. run `textDocument/references` from the
+    /// definition and from a usage in another file, then check that both
+    /// returned the same set of references.
     #[serde(default)]
     batch: Vec<BatchStep>,
     /// Cold-start mode: spawn a fresh server per iteration and measure the full
@@ -2847,13 +2847,14 @@ fn bench_lsp_didopen(
 ///      a. didOpen the entry's file (idempotent — duplicate opens are ignored)
 ///      b. wait for diagnostics on that file
 ///      c. send the method request at `(file, line, col)` and record response
-///   3. After all entries, assert symmetry: every response's location set
-///      must equal every other response's location set. Mismatches are
+///   3. After all entries, check that every response's location set
+///      equals every other response's location set. Mismatches are
 ///      reported (but the bench still returns Ok so timing is captured).
 ///
-/// Use case: validating cross-file enumeration symmetry. For
-/// `textDocument/references`, querying any usage site of a symbol should
-/// return the same complete reference set as querying the definition.
+/// Use case: checking the same LSP method from different places returns
+/// the same answer. For `textDocument/references`, querying from the
+/// definition and from any usage should both return the full reference
+/// set — if they don't, the LSP is missing references somewhere.
 fn bench_lsp_batch(
     srv: &ServerConfig,
     root: &str,
@@ -2993,10 +2994,10 @@ fn bench_lsp_batch(
         })
         .collect();
 
-    let symmetric = sets.windows(2).all(|w| w[0] == w[1]);
-    if !symmetric {
+    let consistent = sets.windows(2).all(|w| w[0] == w[1]);
+    if !consistent {
         eprintln!(
-            "  {} batch symmetry check failed — responses differ across cursor positions",
+            "  {} responses inconsistent across cursors — different files / locations returned different reference sets",
             style("warn").yellow()
         );
         // Print per-step counts and diff vs the first step.
@@ -3015,7 +3016,7 @@ fn bench_lsp_batch(
         }
     } else if verbose {
         eprintln!(
-            "  {} batch symmetry check passed — all {} cursor positions return identical reference sets",
+            "  {} responses consistent — all {} cursors (across files / locations) returned the same reference set",
             style("ok").green(),
             steps.len()
         );
