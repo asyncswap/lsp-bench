@@ -1341,8 +1341,13 @@ fn generate_session_txt(data: &Value) -> String {
             None => continue,
         };
 
-        // Collect metrics from first server for the heading
-        let srv = &servers[0];
+        // Collect metrics from first server for the heading.
+        // `servers` may be empty (e.g. every server skipped due to
+        // "not found"); skip the bench in that case rather than panicking.
+        let srv = match servers.first() {
+            Some(s) => s,
+            None => continue,
+        };
         let p95 = srv.get("p95_ms").and_then(|v| v.as_f64());
         let rss = srv
             .get("rss_kb")

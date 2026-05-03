@@ -5628,6 +5628,43 @@ fn main() {
                                 }
                             }
                         }
+                    } else if !batch_steps.is_empty() {
+                        // Batch mode: 1:1 mapping between iterations and batch entries
+                        // (no baseline iteration — each batch step is its own request).
+                        for (i, ((_ms, resp), step)) in
+                            row.iterations.iter().zip(batch_steps.iter()).enumerate()
+                        {
+                            let step_name =
+                                step.path.file_name().unwrap_or_default().to_string_lossy();
+                            // Per-step expect takes precedence, then method-level
+                            let expect = step.expect.as_ref().or(method_expect);
+                            match expect {
+                                Some(exp) => match check_expectation(resp, exp) {
+                                    Ok(()) => {
+                                        tally.passed += 1;
+                                        eprintln!(
+                                            "  {} [{}] {}",
+                                            style("✓").green().bold(),
+                                            i + 1,
+                                            step_name,
+                                        );
+                                    }
+                                    Err(msg) => {
+                                        tally.failed += 1;
+                                        eprintln!(
+                                            "  {} [{}] {} — {}",
+                                            style("✗").red().bold(),
+                                            i + 1,
+                                            step_name,
+                                            msg,
+                                        );
+                                    }
+                                },
+                                None => {
+                                    tally.skipped += 1;
+                                }
+                            }
+                        }
                     } else if !snapshots.is_empty() {
                         // Snapshot mode: 1:1 mapping between iterations and snapshots
                         for (i, ((_ms, resp), snap)) in
