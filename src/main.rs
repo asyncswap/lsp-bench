@@ -292,6 +292,39 @@ struct DidOpenStep {
     expect: Option<ExpectConfig>,
 }
 
+/// A single step in a `batch` for cross-file LSP method probing.
+///
+/// Each entry opens the file (idempotent), waits for diagnostics, then
+/// sends the method request with the entry's `file/line/col` as the
+/// request target — letting one config exercise many cursor positions
+/// across multiple files in a single bench session.
+///
+/// ```yaml
+/// methods:
+///   textDocument/references:
+///     batch:
+///       - file: src/hub/interfaces/IHubBase.sol
+///         line: 22
+///         col: 8
+///         expect: { minCount: 16 }
+///       - file: tests/contracts/hub/misc/Hub.Skim.t.sol
+///         line: 55
+///         col: 18
+///         expect: { minCount: 16 }
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BatchStep {
+    /// Path to the file to didOpen and request against (relative to project).
+    file: String,
+    /// Line for the request (0-indexed, LSP convention).
+    line: u32,
+    /// Character for the request (0-indexed, LSP convention).
+    col: u32,
+    /// Expected response for this step (for --verify mode).
+    #[serde(default)]
+    expect: Option<ExpectConfig>,
+}
+
 /// A rename step in a multi-rename sequence for workspace/willRenameFiles.
 ///
 /// Each step renames a file and validates the result. The bench harness
@@ -427,6 +460,14 @@ struct MethodConfig {
     /// the count should grow as the server discovers more cross-file references.
     #[serde(default, rename = "didOpen")]
     did_open: Vec<DidOpenStep>,
+    /// Batch of cross-file requests. Each entry opens its `file` (idempotent),
+    /// waits for diagnostics, then sends the method request at that entry's
+    /// `(file, line, col)` — exercising different cursor positions across
+    /// files in one bench session. Useful for validating cross-file
+    /// enumeration symmetry (e.g. `textDocument/references` should return
+    /// the same set regardless of which usage site the cursor is on).
+    #[serde(default)]
+    batch: Vec<BatchStep>,
     /// Cold-start mode: spawn a fresh server per iteration and measure the full
     /// end-to-end time from didOpen through diagnostics through the method response.
     /// This captures what the user actually feels — compilation + request latency.
@@ -2636,6 +2677,15 @@ struct ResolvedDidOpen {
     expect: Option<ExpectConfig>,
 }
 
+/// A resolved batch step: absolute path + line/col + optional `expect`.
+#[derive(Debug, Clone)]
+struct ResolvedBatch {
+    path: PathBuf,
+    line: u32,
+    col: u32,
+    expect: Option<ExpectConfig>,
+}
+
 /// Benchmark an LSP method with sequential didOpen steps.
 ///
 /// Flow:
@@ -2785,6 +2835,192 @@ fn bench_lsp_didopen(
             Err(e) => return BenchResult::Fail { error: e, rss_kb },
         }
     }
+    c.kill();
+    BenchResult::Ok { iterations, rss_kb }
+}
+
+/// Benchmark a batch of cross-file requests at the same logical symbol.
+///
+/// Flow:
+///   1. Spawn server, initialize, wait for the (optional) progress token
+///   2. For each batch entry:
+///      a. didOpen the entry's file (idempotent — duplicate opens are ignored)
+///      b. wait for diagnostics on that file
+///      c. send the method request at `(file, line, col)` and record response
+///   3. After all entries, assert symmetry: every response's location set
+///      must equal every other response's location set. Mismatches are
+///      reported (but the bench still returns Ok so timing is captured).
+///
+/// Use case: validating cross-file enumeration symmetry. For
+/// `textDocument/references`, querying any usage site of a symbol should
+/// return the same complete reference set as querying the definition.
+fn bench_lsp_batch(
+    srv: &ServerConfig,
+    root: &str,
+    cwd: &Path,
+    target_file: &Path,
+    method: &str,
+    steps: &[ResolvedBatch],
+    index_timeout: Duration,
+    timeout: Duration,
+    response_limit: usize,
+    on_progress: &dyn Fn(&str),
+    init_settings: Option<&Value>,
+    verbose: bool,
+    wait_for_progress_token: Option<&str>,
+) -> BenchResult {
+    on_progress("spawning");
+    let mut c = match LspClient::spawn(&srv.cmd, &srv.args, cwd, verbose) {
+        Ok(c) => c,
+        Err(e) => {
+            return BenchResult::Fail {
+                error: e,
+                rss_kb: None,
+            }
+        }
+    };
+    if let Err(e) = c.initialize(root, init_settings) {
+        let rss = get_rss(c.child.id());
+        return BenchResult::Fail {
+            error: e,
+            rss_kb: rss,
+        };
+    }
+    if let Err(e) = c.open_file(target_file) {
+        let rss = get_rss(c.child.id());
+        return BenchResult::Fail {
+            error: e,
+            rss_kb: rss,
+        };
+    }
+    on_progress("waiting for diagnostics");
+    if let Err(e) = c.wait_for_valid_diagnostics(index_timeout) {
+        let rss = get_rss(c.child.id());
+        return BenchResult::Fail {
+            error: format!("wait_for_diagnostics: {}", e),
+            rss_kb: rss,
+        };
+    }
+    if wait_for_progress_token.is_some() {
+        on_progress("waiting for project index");
+        c.wait_for_progress_end(index_timeout, wait_for_progress_token);
+    }
+    let rss_kb = get_rss(c.child.id());
+
+    let total = steps.len();
+    let mut iterations = Vec::new();
+    let mut responses: Vec<Value> = Vec::new();
+    for (si, step) in steps.iter().enumerate() {
+        let step_name = step
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        on_progress(&format!("[{}/{}] batch {}", si + 1, total, step_name));
+
+        // Open the step's file (idempotent — re-opening is fine, server
+        // de-dupes via uri).
+        if let Err(e) = c.open_file(&step.path) {
+            return BenchResult::Fail { error: e, rss_kb };
+        }
+        if let Err(e) = c.wait_for_valid_diagnostics(index_timeout) {
+            return BenchResult::Fail {
+                error: format!("wait_for_diagnostics on batch step {}: {}", step_name, e),
+                rss_kb,
+            };
+        }
+
+        let step_uri = uri(&step.path);
+        let params = json!({
+            "textDocument": { "uri": &step_uri },
+            "position": { "line": step.line, "character": step.col },
+            "context": { "includeDeclaration": true },
+        });
+        let start = Instant::now();
+        let req_id = match c.send(method, params) {
+            Ok(id) => id,
+            Err(e) => return BenchResult::Fail { error: e, rss_kb },
+        };
+        match c.read_response(req_id, timeout) {
+            Ok(resp) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                let summary = response_summary(&resp, response_limit);
+                let count = resp
+                    .get("result")
+                    .and_then(|r| r.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                on_progress(&format!(
+                    "[{}/{}] {}  {:.1}ms  ({} refs)",
+                    si + 1,
+                    total,
+                    step_name,
+                    ms,
+                    count
+                ));
+                iterations.push((ms, summary));
+                responses.push(resp);
+            }
+            Err(e) => return BenchResult::Fail { error: e, rss_kb },
+        }
+    }
+
+    // Symmetry check: every response's location set must match every other.
+    let sets: Vec<std::collections::BTreeSet<(String, u32, u32, u32, u32)>> = responses
+        .iter()
+        .map(|resp| {
+            resp.get("result")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|loc| {
+                            let uri_s = loc.get("uri").and_then(|u| u.as_str())?.to_string();
+                            let r = loc.get("range")?;
+                            let s = r.get("start")?;
+                            let e = r.get("end")?;
+                            Some((
+                                uri_s,
+                                s.get("line")?.as_u64().unwrap_or(0) as u32,
+                                s.get("character")?.as_u64().unwrap_or(0) as u32,
+                                e.get("line")?.as_u64().unwrap_or(0) as u32,
+                                e.get("character")?.as_u64().unwrap_or(0) as u32,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let symmetric = sets.windows(2).all(|w| w[0] == w[1]);
+    if !symmetric {
+        eprintln!(
+            "  {} batch symmetry check failed — responses differ across cursor positions",
+            style("warn").yellow()
+        );
+        // Print per-step counts and diff vs the first step.
+        if let Some(first) = sets.first() {
+            for (i, s) in sets.iter().enumerate() {
+                let extra: Vec<_> = s.difference(first).collect();
+                let missing: Vec<_> = first.difference(s).collect();
+                eprintln!(
+                    "    step {}: {} refs ({}+{}- vs step 1)",
+                    i + 1,
+                    s.len(),
+                    extra.len(),
+                    missing.len(),
+                );
+            }
+        }
+    } else if verbose {
+        eprintln!(
+            "  {} batch symmetry check passed — all {} cursor positions return identical reference sets",
+            style("ok").green(),
+            steps.len()
+        );
+    }
+
     c.kill();
     BenchResult::Ok { iterations, rss_kb }
 }
@@ -4836,6 +5072,20 @@ fn main() {
                         .collect()
                 })
                 .unwrap_or_default();
+            let batch_steps: Vec<ResolvedBatch> = methods
+                .get(*method)
+                .map(|m| {
+                    m.batch
+                        .iter()
+                        .map(|s| ResolvedBatch {
+                            path: cwd.join(&s.file),
+                            line: s.line,
+                            col: s.col,
+                            expect: s.expect.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             if !snapshots.is_empty() {
                 eprintln!(
                     "  {} {} snapshot(s) via didChange",
@@ -4983,6 +5233,27 @@ fn main() {
                         &did_open_steps,
                         bl,
                         bc,
+                        index_timeout,
+                        timeout,
+                        response_limit,
+                        on_progress,
+                        init_settings.as_ref(),
+                        verbose,
+                        progress_token,
+                    )
+                })
+            } else if !batch_steps.is_empty() {
+                let progress_token = methods
+                    .get(*method)
+                    .and_then(|m| m.wait_for_progress_token.as_deref());
+                run_bench(&avail, response_limit, |srv, on_progress| {
+                    bench_lsp_batch(
+                        srv,
+                        &root,
+                        &cwd,
+                        &bench_sol,
+                        lsp_method,
+                        &batch_steps,
                         index_timeout,
                         timeout,
                         response_limit,
