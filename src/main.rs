@@ -325,14 +325,14 @@ struct BatchStep {
     expect: Option<ExpectConfig>,
 }
 
-/// A rename step in a multi-rename sequence for workspace/willRenameFiles.
+/// A file in a multi-rename sequence for workspace/willRenameFiles.
 ///
-/// Each step renames a file and validates the result. The bench harness
-/// executes the full LSP lifecycle for each step:
+/// Each entry renames a file and validates the result. The bench harness
+/// executes the full LSP lifecycle for each entry:
 ///   willRenameFiles → apply edits → rename on disk → didRenameFiles → wait for re-index
 ///
 /// ```yaml
-/// renameSteps:
+/// renameFiles:
 ///   - file: A.sol            # file to rename (relative to project root)
 ///     newName: AA.sol         # new filename
 ///     expect:
@@ -343,7 +343,7 @@ struct BatchStep {
 ///       count: 1
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct RenameStep {
+struct RenameFile {
     /// File to rename (relative to project root).
     file: String,
     /// New filename (just the filename, not a path).
@@ -354,14 +354,14 @@ struct RenameStep {
     expect: Option<ExpectConfig>,
 }
 
-/// A create step in a lifecycle sequence for workspace/willCreateFiles.
+/// A file in a lifecycle sequence for workspace/willCreateFiles.
 ///
 /// ```yaml
-/// createSteps:
+/// createFiles:
 ///   - file: test/NewFile.sol
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct CreateStep {
+struct CreateFile {
     /// File to create (relative to project root).
     file: String,
     /// Expected response (for --verify mode).
@@ -369,14 +369,14 @@ struct CreateStep {
     expect: Option<ExpectConfig>,
 }
 
-/// A delete step in a lifecycle sequence for workspace/willDeleteFiles.
+/// A file in a lifecycle sequence for workspace/willDeleteFiles.
 ///
 /// ```yaml
-/// deleteSteps:
+/// deleteFiles:
 ///   - file: src/Foo.sol
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct DeleteStep {
+struct DeleteFile {
     /// File to delete (relative to project root).
     file: String,
     /// Expected response (for --verify mode).
@@ -477,18 +477,18 @@ struct MethodConfig {
     /// full rename lifecycle: willRenameFiles → apply edits on disk → didRenameFiles
     /// → wait for re-index. This tests the real-world multi-rename scenario where
     /// each rename mutates state and the next rename must work on the new state.
-    #[serde(default, rename = "renameSteps")]
-    rename_steps: Vec<RenameStep>,
+    #[serde(default, rename = "renameFiles")]
+    rename_files: Vec<RenameFile>,
     /// Sequential create steps for workspace/willCreateFiles. Each step is a
     /// full create lifecycle: willCreateFiles → apply edits on disk (if any)
     /// → create file on disk → didCreateFiles.
-    #[serde(default, rename = "createSteps")]
-    create_steps: Vec<CreateStep>,
+    #[serde(default, rename = "createFiles")]
+    create_files: Vec<CreateFile>,
     /// Sequential delete steps for workspace/willDeleteFiles. Each step is a
     /// full delete lifecycle: willDeleteFiles → apply edits on disk (if any)
     /// → delete file on disk → didDeleteFiles.
-    #[serde(default, rename = "deleteSteps")]
-    delete_steps: Vec<DeleteStep>,
+    #[serde(default, rename = "deleteFiles")]
+    delete_files: Vec<DeleteFile>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3046,7 +3046,7 @@ fn bench_lsp_rename_sequence(
     root: &str,
     cwd: &Path,
     target_file: &Path,
-    steps: &[RenameStep],
+    steps: &[RenameFile],
     index_timeout: Duration,
     timeout: Duration,
     response_limit: usize,
@@ -3093,7 +3093,7 @@ fn bench_lsp_rename_sequence(
     // Always run rename cycles and return to the original filename by renaming
     // back. If the provided steps do not return to the starting file path,
     // synthesize a final reverse step.
-    let mut run_steps: Vec<RenameStep> = steps.to_vec();
+    let mut run_steps: Vec<RenameFile> = steps.to_vec();
     if !run_steps.is_empty() {
         let original = PathBuf::from(&run_steps[0].file);
         let original_name = original
@@ -3116,7 +3116,7 @@ fn bench_lsp_rename_sequence(
         }
 
         if current != original {
-            run_steps.push(RenameStep {
+            run_steps.push(RenameFile {
                 file: current.to_string_lossy().to_string(),
                 new_name: original_name,
                 expect: None,
@@ -3534,7 +3534,7 @@ fn bench_lsp_create_sequence(
     root: &str,
     cwd: &Path,
     target_file: &Path,
-    steps: &[CreateStep],
+    steps: &[CreateFile],
     index_timeout: Duration,
     timeout: Duration,
     response_limit: usize,
@@ -3660,7 +3660,7 @@ fn bench_lsp_delete_sequence(
     root: &str,
     cwd: &Path,
     target_file: &Path,
-    steps: &[DeleteStep],
+    steps: &[DeleteFile],
     index_timeout: Duration,
     timeout: Duration,
     response_limit: usize,
@@ -4170,6 +4170,25 @@ enum Commands {
         #[arg(short, long, default_value = "benchmark.yaml")]
         config: Option<String>,
     },
+    /// Inspect a benchmark results.json — print every Location with the
+    /// resolved symbol text and grouping by file. Use after a run to see
+    /// what the LSP actually returned (faster than `jq`).
+    Inspect {
+        /// Path to the results.json file to inspect.
+        results: String,
+
+        /// Index into `.benchmarks[]` (default: 0).
+        #[arg(short, long, default_value = "0")]
+        benchmark: usize,
+
+        /// Index into `.benchmarks[i].servers[]` (default: 0).
+        #[arg(short, long, default_value = "0")]
+        server: usize,
+
+        /// Output format: pretty (default), json, tsv.
+        #[arg(short, long, default_value = "pretty")]
+        format: String,
+    },
     /// Replay a JSON-RPC request from benchmark output against an LSP server
     Replay {
         /// Server command (e.g. "solc --lsp", "solidity-ls --stdio")
@@ -4209,6 +4228,234 @@ fn init_config(path: &str) {
     eprintln!();
     eprintln!("Edit the file to configure your servers, then run:");
     eprintln!("  lsp-bench");
+}
+
+/// Inspect a results.json — print every Location with the resolved symbol
+/// text plus a per-file grouping. Replaces the need for an external `jq`
+/// recipe or a side script for "what did the LSP actually return?".
+fn inspect_results(path: &str, bench_idx: usize, server_idx: usize, format: &str) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    let data: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error parsing {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    let bench = match data
+        .get("benchmarks")
+        .and_then(|b| b.as_array())
+        .and_then(|a| a.get(bench_idx))
+    {
+        Some(b) => b,
+        None => {
+            eprintln!("benchmarks[{}] not found", bench_idx);
+            std::process::exit(1);
+        }
+    };
+    let server = match bench
+        .get("servers")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.get(server_idx))
+    {
+        Some(s) => s,
+        None => {
+            eprintln!("benchmarks[{}].servers[{}] not found", bench_idx, server_idx);
+            std::process::exit(1);
+        }
+    };
+
+    let response = server.get("response");
+
+    // --- json passthrough --------------------------------------------------
+    if format == "json" {
+        match response {
+            Some(r) => println!("{}", serde_json::to_string_pretty(r).unwrap()),
+            None => println!("null"),
+        }
+        return;
+    }
+
+    // --- header (shared by pretty/tsv) -------------------------------------
+    let method = bench
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("?");
+    let server_name = server
+        .get("server")
+        .and_then(|n| n.as_str())
+        .unwrap_or("?");
+    let status = server
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    let mean_ms = server
+        .get("mean_ms")
+        .and_then(|n| n.as_f64())
+        .unwrap_or(0.0);
+
+    if format == "pretty" {
+        println!("results: {}", path);
+        println!("benchmark[{}]: {}", bench_idx, method);
+        println!(
+            "server[{}]:    {} (status={}, mean={:.2}ms)",
+            server_idx, server_name, status, mean_ms
+        );
+        if let Some(input) = bench.get("input").and_then(|i| i.as_str()) {
+            let trimmed = if input.len() > 200 {
+                format!("{}...", &input[..200])
+            } else {
+                input.to_string()
+            };
+            println!("input:    {}", trimmed);
+        }
+        println!();
+    }
+
+    // --- response is a list of Locations? ----------------------------------
+    let arr = match response.and_then(|r| r.as_array()) {
+        Some(a) => a,
+        None => {
+            // Non-Location response — print it raw.
+            if format == "tsv" {
+                println!("response_type\tcount");
+                println!(
+                    "{}\t{}",
+                    response
+                        .map(|r| r.as_str().map(|_| "string").unwrap_or("non-array"))
+                        .unwrap_or("null"),
+                    if response.map(|r| r.is_null()).unwrap_or(true) {
+                        0
+                    } else {
+                        1
+                    }
+                );
+            } else if let Some(r) = response {
+                println!(
+                    "response (non-array): {}",
+                    serde_json::to_string_pretty(r).unwrap_or_default()
+                );
+            } else {
+                println!("response: null");
+            }
+            return;
+        }
+    };
+
+    // Group by file, preserving order via BTreeMap on file path.
+    let mut by_file: std::collections::BTreeMap<String, Vec<&Value>> =
+        std::collections::BTreeMap::new();
+    for loc in arr {
+        let uri_str = loc
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
+        let path = uri_str.strip_prefix("file://").unwrap_or(&uri_str).to_string();
+        by_file.entry(path).or_default().push(loc);
+    }
+
+    // Find a common path prefix to shorten output.
+    let paths: Vec<&String> = by_file.keys().collect();
+    let mut common: String = paths.first().map(|s| s.to_string()).unwrap_or_default();
+    for p in paths.iter().skip(1) {
+        let take = common
+            .chars()
+            .zip(p.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common = common.chars().take(take).collect();
+    }
+    if let Some(idx) = common.rfind('/') {
+        common.truncate(idx + 1);
+    } else {
+        common.clear();
+    }
+
+    if format == "tsv" {
+        println!("file\tline\tstart_col\tend_col\tsymbol\tsource_line");
+        for (path, ranges) in &by_file {
+            let lines = std::fs::read_to_string(path)
+                .ok()
+                .map(|s| s.lines().map(|l| l.to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let rel = path.strip_prefix(&common).unwrap_or(path);
+            for r in ranges {
+                let (line, sc, ec) = extract_range(r);
+                let src = lines.get(line as usize).map(|s| s.as_str()).unwrap_or("");
+                let sym = src
+                    .get(sc as usize..ec as usize)
+                    .unwrap_or("")
+                    .to_string();
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    rel,
+                    line + 1,
+                    sc + 1,
+                    ec + 1,
+                    sym,
+                    src.trim()
+                );
+            }
+        }
+        return;
+    }
+
+    // pretty
+    println!("total locations: {}\n", arr.len());
+    for (path, ranges) in &by_file {
+        let lines = std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.lines().map(|l| l.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let rel = path.strip_prefix(&common).unwrap_or(path);
+        println!("=== {}  ({} refs) ===", rel, ranges.len());
+        for r in ranges {
+            let (line, sc, ec) = extract_range(r);
+            let src = lines.get(line as usize).map(|s| s.as_str()).unwrap_or("");
+            let sym = src.get(sc as usize..ec as usize).unwrap_or("");
+            println!(
+                "  {:>5}:{:<3}-{:<3}  [{}]  {}",
+                line + 1,
+                sc + 1,
+                ec + 1,
+                sym,
+                src.trim()
+            );
+        }
+        println!();
+    }
+    if !common.is_empty() {
+        println!("common prefix stripped: {}", common);
+    }
+}
+
+/// Extract a Location's `(line, start_col, end_col)` as 0-indexed u32s.
+fn extract_range(loc: &Value) -> (u32, u32, u32) {
+    let r = loc.get("range");
+    let line = r
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0) as u32;
+    let sc = r
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("character"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0) as u32;
+    let ec = r
+        .and_then(|r| r.get("end"))
+        .and_then(|s| s.get("character"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0) as u32;
+    (line, sc, ec)
 }
 
 fn replay(server: &str, input: &str, project: Option<&str>, file: Option<&str>, timeout_secs: u64) {
@@ -4332,6 +4579,15 @@ fn main() {
         Some(Commands::Init { config }) => {
             let path = config.as_deref().unwrap_or(&cli.config);
             init_config(path);
+            std::process::exit(0);
+        }
+        Some(Commands::Inspect {
+            results,
+            benchmark,
+            server,
+            format,
+        }) => {
+            inspect_results(&results, benchmark, server, &format);
             std::process::exit(0);
         }
         Some(Commands::Replay {
@@ -5100,37 +5356,37 @@ fn main() {
                     did_open_steps.len()
                 );
             }
-            let rename_steps: Vec<RenameStep> = methods
+            let rename_files: Vec<RenameFile> = methods
                 .get(*method)
-                .map(|m| m.rename_steps.clone())
+                .map(|m| m.rename_files.clone())
                 .unwrap_or_default();
-            let create_steps: Vec<CreateStep> = methods
+            let create_files: Vec<CreateFile> = methods
                 .get(*method)
-                .map(|m| m.create_steps.clone())
+                .map(|m| m.create_files.clone())
                 .unwrap_or_default();
-            let delete_steps: Vec<DeleteStep> = methods
+            let delete_files: Vec<DeleteFile> = methods
                 .get(*method)
-                .map(|m| m.delete_steps.clone())
+                .map(|m| m.delete_files.clone())
                 .unwrap_or_default();
-            if !rename_steps.is_empty() {
+            if !rename_files.is_empty() {
                 eprintln!(
                     "  {} {} rename step(s) (full lifecycle)",
                     style("rename").magenta(),
-                    rename_steps.len()
+                    rename_files.len()
                 );
             }
-            if !create_steps.is_empty() {
+            if !create_files.is_empty() {
                 eprintln!(
                     "  {} {} create step(s) (full lifecycle)",
                     style("create").cyan(),
-                    create_steps.len()
+                    create_files.len()
                 );
             }
-            if !delete_steps.is_empty() {
+            if !delete_files.is_empty() {
                 eprintln!(
                     "  {} {} delete step(s) (full lifecycle)",
                     style("delete").yellow(),
-                    delete_steps.len()
+                    delete_files.len()
                 );
             }
             let is_cold = methods.get(*method).map_or(false, |m| m.cold);
@@ -5140,14 +5396,14 @@ fn main() {
                     style("cold").red()
                 );
             }
-            let rows = if !rename_steps.is_empty() {
+            let rows = if !rename_files.is_empty() {
                 run_bench(&avail, response_limit, |srv, on_progress| {
                     bench_lsp_rename_sequence(
                         srv,
                         &root,
                         &cwd,
                         &bench_sol,
-                        &rename_steps,
+                        &rename_files,
                         index_timeout,
                         timeout,
                         response_limit,
@@ -5156,14 +5412,14 @@ fn main() {
                         verbose,
                     )
                 })
-            } else if !create_steps.is_empty() {
+            } else if !create_files.is_empty() {
                 run_bench(&avail, response_limit, |srv, on_progress| {
                     bench_lsp_create_sequence(
                         srv,
                         &root,
                         &cwd,
                         &bench_sol,
-                        &create_steps,
+                        &create_files,
                         index_timeout,
                         timeout,
                         response_limit,
@@ -5172,14 +5428,14 @@ fn main() {
                         verbose,
                     )
                 })
-            } else if !delete_steps.is_empty() {
+            } else if !delete_files.is_empty() {
                 run_bench(&avail, response_limit, |srv, on_progress| {
                     bench_lsp_delete_sequence(
                         srv,
                         &root,
                         &cwd,
                         &bench_sol,
-                        &delete_steps,
+                        &delete_files,
                         index_timeout,
                         timeout,
                         response_limit,
