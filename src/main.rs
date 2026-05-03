@@ -7,8 +7,22 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// SIGINT-triggered "please stop at next safe point" flag. Set by the
+/// Ctrl-C handler installed in `main()`. Long-blocking loops (recv,
+/// wait_for_progress_end, the dispatch loop) check this and break out
+/// so existing Drop impls run — partial results stay on disk and child
+/// LSPs shut down gracefully via `LspClient::shutdown_gracefully`
+/// (5s wait, then force-kill) instead of being orphaned.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
 
 // ── Server Registry ─────────────────────────────────────────────────────────
@@ -973,10 +987,26 @@ impl LspClient {
     }
 
     fn recv(&mut self, timeout: Duration) -> Result<Value, String> {
-        self.rx.recv_timeout(timeout).map_err(|e| match e {
-            mpsc::RecvTimeoutError::Timeout => "timeout".to_string(),
-            mpsc::RecvTimeoutError::Disconnected => "EOF".to_string(),
-        })
+        // Poll in short intervals so a SIGINT-set INTERRUPTED flag
+        // unblocks long waits (index_timeout: 300 etc.) within ~100ms
+        // of Ctrl-C. Without polling, recv_timeout would happily block
+        // for the full timeout duration and miss the interrupt.
+        let deadline = Instant::now() + timeout;
+        loop {
+            if interrupted() {
+                return Err("interrupted".to_string());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timeout".to_string());
+            }
+            let poll = remaining.min(Duration::from_millis(100));
+            match self.rx.recv_timeout(poll) {
+                Ok(msg) => return Ok(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err("EOF".to_string()),
+            }
+        }
     }
 
     fn read_response(&mut self, expected_id: i64, timeout: Duration) -> Result<Value, String> {
@@ -3931,6 +3961,12 @@ where
 {
     let mut rows = Vec::new();
     for srv in servers {
+        // Check the SIGINT flag between servers — break out cleanly so
+        // any per-method save_json that already ran is preserved and
+        // the next method's `c.kill()` (Drop) shutdown still happens.
+        if interrupted() {
+            break;
+        }
         let pb = spinner(&srv.label);
         let on_progress = |msg: &str| pb.set_message(msg.to_string());
         match f(srv, &on_progress) {
@@ -4573,6 +4609,19 @@ fn replay(server: &str, input: &str, project: Option<&str>, file: Option<&str>, 
 }
 
 fn main() {
+    // Install Ctrl-C handler before anything else. The handler just sets
+    // a flag; long-blocking loops poll it and break out at the next safe
+    // point, letting `LspClient::Drop` run a graceful LSP shutdown
+    // (shutdown → exit → close stdin → wait → kill). Without this, Ctrl-C
+    // during indexing left orphan LSP children consuming GBs of RSS.
+    let _ = ctrlc::set_handler(|| {
+        // Idempotent — second Ctrl-C does nothing extra; main loops will
+        // see the flag eventually. (If users want a hard exit, they can
+        // SIGKILL the bench process.)
+        INTERRUPTED.store(true, Ordering::Relaxed);
+        eprintln!("\n{} interrupt received — stopping at next safe point, child LSPs will shut down cleanly", style("warn").yellow());
+    });
+
     let cli = Cli::parse();
 
     // Handle subcommands before loading config

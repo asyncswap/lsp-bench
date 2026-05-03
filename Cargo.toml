@@ -1,6 +1,6 @@
 [package]
 name = "lsp-bench"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Benchmark framework for Language Server Protocol (LSP) servers"
 license = "MIT"
@@ -26,3 +26,4 @@ serde_yaml = "0.9"
 indicatif = "0.17"
 console = "0.15"
 sysinfo = "0.30"
+ctrlc = "3"
